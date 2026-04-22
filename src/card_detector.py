@@ -9,21 +9,13 @@ import json
 import openai
 from dotenv import load_dotenv
 
+from config import CARD_NAMES
+
 load_dotenv()
 
-# Known card names — must match what index.py stores in metadata
-CARD_NAMES = [
-    "Amex Gold",
-    "Amex Platinum",
-    "Amex Delta Gold",
-    "Bilt Palladium",
-    "Capital One Venture X",
-    "United Explorer",
-]
+_client = openai.OpenAI()
 
-_oai_client = openai.OpenAI()
-
-CARD_DETECT_PROMPT = f"""You are a card name detector. Given a user question about credit card benefits, identify which card(s) the question is about.
+_SYSTEM_PROMPT = f"""You are a card name detector. Given a user question about credit card benefits, identify which card(s) the question is about.
 
 Available cards: {json.dumps(CARD_NAMES)}
 
@@ -41,18 +33,15 @@ Return a JSON array of card names. Examples:
 
 def detect_cards(question: str) -> list[str]:
     """Detect which card(s) a question is about using an LLM."""
-    response = _oai_client.chat.completions.create(
+    response = _client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": CARD_DETECT_PROMPT},
+            {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ],
     )
-
     result = json.loads(response.choices[0].message.content)
-    # Handle both {"cards": [...]} and [...] formats
     cards = result if isinstance(result, list) else result.get("cards", [])
-    # Validate against known card names
     return [c for c in cards if c in CARD_NAMES]

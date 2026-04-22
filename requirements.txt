@@ -1,4 +1,6 @@
 # Core RAG pipeline
+llama-index-postprocessor-cohere-rerank==0.8.0
+llama-index-retrievers-bm25==0.7.1
 llama-index-core==0.14.20
 llama-index-vector-stores-chroma==0.5.5
 llama-index-embeddings-openai==0.6.0

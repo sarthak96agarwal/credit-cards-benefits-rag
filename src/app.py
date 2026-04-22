@@ -1,14 +1,16 @@
 """
-Phase 1: Streamlit UI for the credit card benefits RAG chatbot.
+Streamlit UI for the credit card benefits RAG chatbot.
 Run with: streamlit run src/app.py
 """
 
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 from query import load_query_engine, query
+from config import CARD_NAMES, TOP_K, RERANK_TOP_K, EMBED_MODEL, LLM_MODEL, RERANK_MODEL
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -19,15 +21,17 @@ st.set_page_config(
 )
 
 st.title("💳 Credit Card Benefits Assistant")
-st.caption("Phase 1 — Naive RAG | Ask anything about your card benefits")
+reranker_on = bool(os.getenv("COHERE_API_KEY"))
+phase_note = "Hybrid Search + Reranker" if reranker_on else "Hybrid Search (reranker disabled)"
+st.caption(f"Phase 2 — {phase_note}")
 
-# ── Load query engine (cached so it doesn't reload on every interaction) ──────
+# ── Load engine (cached so it doesn't reload on every interaction) ─────────────
 
 @st.cache_resource
 def get_engine():
     try:
         return load_query_engine()
-    except FileNotFoundError as e:
+    except FileNotFoundError:
         return None
 
 engine = get_engine()
@@ -41,13 +45,15 @@ if engine is None:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Render existing messages
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
-        if msg["role"] == "assistant" and "sources" in msg:
+        if msg["role"] == "assistant" and "meta" in msg:
+            meta = msg["meta"]
+            if meta.get("detected_cards"):
+                st.caption(f"🃏 Detected cards: {', '.join(meta['detected_cards'])}")
             with st.expander("📄 Retrieved chunks"):
-                for i, src in enumerate(msg["sources"]):
+                for i, src in enumerate(meta["sources"]):
                     st.markdown(f"**[{i+1}] {src['card_name']}** — Page {src['page']} | Score: `{src['score']}`")
                     st.caption(src["text"][:400] + ("..." if len(src["text"]) > 400 else ""))
                     st.divider()
@@ -55,53 +61,49 @@ for msg in st.session_state.messages:
 # ── Chat input ────────────────────────────────────────────────────────────────
 
 if prompt := st.chat_input("Ask about your card benefits..."):
-    # Show user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # Get answer
     with st.chat_message("assistant"):
         with st.spinner("Searching benefits docs..."):
             result = query(prompt, engine)
 
         st.write(result["answer"])
 
+        if result["detected_cards"]:
+            st.caption(f"🃏 Detected cards: {', '.join(result['detected_cards'])}")
+
         with st.expander("📄 Retrieved chunks"):
             if not result["sources"]:
-                st.write("No relevant chunks found above similarity threshold.")
+                st.write("No chunks retrieved.")
             for i, src in enumerate(result["sources"]):
                 st.markdown(f"**[{i+1}] {src['card_name']}** — Page {src['page']} | Score: `{src['score']}`")
                 st.caption(src["text"][:400] + ("..." if len(src["text"]) > 400 else ""))
                 st.divider()
 
-    # Save assistant message
     st.session_state.messages.append({
         "role": "assistant",
         "content": result["answer"],
-        "sources": result["sources"],
+        "meta": {"detected_cards": result["detected_cards"], "sources": result["sources"]},
     })
 
-# ── Sidebar: debug info ───────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("🔧 Phase 1 Settings")
-    st.markdown("""
-    **Chunking:** Fixed 512 tokens, 50 overlap  
-    **Retrieval:** Dense only (cosine similarity)  
-    **Top-k:** 5 chunks  
-    **Similarity cutoff:** 0.3  
-    **Model:** gpt-4o-mini  
-    **Embeddings:** text-embedding-3-small  
+    st.header("⚙️ Pipeline Settings")
+    st.markdown(f"""
+    **Retrieval:** Hybrid (vector + BM25 + RRF)
+    **Reranker:** {"✅ Cohere " + RERANK_MODEL if reranker_on else "❌ disabled"}
+    **Candidates per card:** {TOP_K} × 2 retrievers → RRF
+    **Final chunks:** {RERANK_TOP_K} (after rerank)
+    **LLM:** {LLM_MODEL}
+    **Embeddings:** {EMBED_MODEL}
     """)
     st.divider()
-    st.markdown("**Known limitations to observe:**")
-    st.markdown("""
-    - Chunks may cut mid-sentence  
-    - Exact terms (e.g. Priority Pass) may not retrieve well  
-    - No cross-card comparison support  
-    - Hallucinations possible when context is weak  
-    """)
+    st.markdown("**Supported cards:**")
+    for card in CARD_NAMES:
+        st.markdown(f"- {card}")
     st.divider()
     if st.button("🗑️ Clear chat"):
         st.session_state.messages = []

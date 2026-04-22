@@ -1,144 +1,98 @@
 """
-Phase 2: Query engine with metadata filtering
-- Detects which card(s) a query is about (via card_detector.py)
-- Filters retrieval to only relevant card(s)
-- For cross-card queries, retrieves per card and merges results
+Query orchestration.
+
+Ties together card detection, retrieval, and response synthesis:
+  1. detect_cards  — identify which card(s) the question is about
+  2. hybrid_retrieve — vector + BM25 + RRF + rerank, per card
+  3. synthesize    — generate a grounded answer from the retrieved chunks
 """
 
-from pathlib import Path
 from dotenv import load_dotenv
-
-import chromadb
-from llama_index.core import VectorStoreIndex, Settings
-from llama_index.core.retrievers import VectorIndexRetriever
-from llama_index.core.postprocessor import SimilarityPostprocessor
-from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, FilterOperator
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core import StorageContext
+from llama_index.core import Settings
+from llama_index.core.response_synthesizers import get_response_synthesizer
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
+from config import EMBED_MODEL, LLM_MODEL, RERANK_TOP_K, SYSTEM_PROMPT
 from card_detector import detect_cards
+from store import load_index, get_all_nodes
+from retriever import hybrid_retrieve
 
 load_dotenv()
 
-CHROMA_DIR = Path("data/chroma_db")
-COLLECTION_NAME = "cc_benefits"
-TOP_K = 5  # number of chunks to retrieve per card
-
-SYSTEM_PROMPT = """You are a credit card benefits assistant.
-
-Answer ONLY using the provided context from the benefits documents.
-
-IMPORTANT RULES:
-- If the context does not mention a benefit, say clearly:
-  "This benefit is not mentioned in the [Card Name] benefits guide."
-- Never assume a benefit exists if it is not explicitly stated in the context.
-- Never answer from general knowledge about credit cards.
-- Always state which card you are referring to."""
-
-Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0, system_prompt=SYSTEM_PROMPT)
-Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+Settings.llm = OpenAI(model=LLM_MODEL, temperature=0, system_prompt=SYSTEM_PROMPT)
+Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL)
 
 
-def _load_index():
-    """Load the persisted ChromaDB index."""
-    if not CHROMA_DIR.exists():
-        raise FileNotFoundError(
-            f"No index found at {CHROMA_DIR}. Run `python src/index.py` first."
-        )
+# ── Engine loader ─────────────────────────────────────────────────────────────
 
-    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
-    vector_store = ChromaVectorStore(chroma_collection=collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-    return VectorStoreIndex.from_vector_store(
-        vector_store,
-        storage_context=storage_context,
-    )
-
-
-def _build_retriever(index, card_name: str | None = None):
-    """Build a retriever, optionally filtered to a specific card."""
-    filters = None
-    if card_name:
-        filters = MetadataFilters(filters=[
-            MetadataFilter(key="card_name", value=card_name, operator=FilterOperator.EQ),
-        ])
-
-    return VectorIndexRetriever(
-        index=index,
-        similarity_top_k=TOP_K,
-        filters=filters,
-    )
-
-
-def _retrieve_nodes(index, question: str, card_name: str | None = None):
-    """Retrieve and post-process nodes for a single card (or all cards)."""
-    retriever = _build_retriever(index, card_name)
-    nodes = retriever.retrieve(question)
-
-    # Filter out low-similarity chunks
-    postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)
-    nodes = postprocessor.postprocess_nodes(nodes, query_str=question)
-
-    return nodes
-
-
-def load_query_engine():
-    """Load the index — returned object is the index itself now."""
-    return _load_index()
-
-
-def query(question: str, query_engine=None):
+def load_query_engine() -> tuple:
     """
-    Ask a question and return the answer + source chunks.
-
-    Detects card names in the question:
-    - Single card: filters retrieval to that card only
-    - Multiple cards: retrieves per card separately, merges results
-    - No card detected: retrieves from all cards (unfiltered)
+    Load the index and prepare all nodes for BM25.
 
     Returns:
-        dict with keys:
-            - answer (str)
-            - sources (list of dicts with text, card_name, score, page)
-            - detected_cards (list of card names detected in the question)
+        (index, all_nodes) — pass this to query() to avoid reloading on each call.
     """
-    index = query_engine if query_engine is not None else _load_index()
+    index, collection = load_index()
+    all_nodes = get_all_nodes(collection)
+    return index, all_nodes
+
+
+# ── Main query function ───────────────────────────────────────────────────────
+
+def query(question: str, query_engine: tuple | None = None) -> dict:
+    """
+    Ask a question and return a grounded answer with source attribution.
+
+    Card detection determines retrieval scope:
+    - 0 cards detected  → unfiltered search across all cards
+    - 1 card detected   → search filtered to that card only
+    - 2+ cards detected → per-card search, results merged
+
+    Args:
+        question:     The user's natural-language question.
+        query_engine: (index, all_nodes) from load_query_engine(). If None,
+                      loads fresh from disk (slower — use for one-off calls).
+
+    Returns:
+        {
+            "answer":         str,
+            "sources":        list of {text, card_name, source_file, page, score},
+            "detected_cards": list of card names found in the question,
+        }
+    """
+    index, all_nodes = query_engine if query_engine else load_query_engine()
     detected = detect_cards(question)
 
     if len(detected) == 0:
-        # No card detected — unfiltered retrieval
-        nodes = _retrieve_nodes(index, question)
-    elif len(detected) == 1:
-        # Single card — filter to that card
-        nodes = _retrieve_nodes(index, question, card_name=detected[0])
-    else:
-        # Multiple cards — retrieve per card, merge, and sort by score
-        all_nodes = []
-        for card in detected:
-            card_nodes = _retrieve_nodes(index, question, card_name=card)
-            all_nodes.extend(card_nodes)
-        # Sort by score descending, keep top results
-        all_nodes.sort(key=lambda n: n.score or 0, reverse=True)
-        nodes = all_nodes[:TOP_K * len(detected)]
+        nodes = hybrid_retrieve(index, all_nodes, question)
 
-    # Build the query engine with the pre-retrieved nodes
-    from llama_index.core.response_synthesizers import get_response_synthesizer
+    elif len(detected) == 1:
+        nodes = hybrid_retrieve(index, all_nodes, question, card_name=detected[0])
+
+    else:
+        # Per-card retrieval — keeps each card's chunks from being diluted
+        # by the other card's semantic similarity scores during vector search.
+        merged = []
+        for card in detected:
+            merged.extend(hybrid_retrieve(index, all_nodes, question, card_name=card))
+        # Re-sort by reranker score; keep top N per card
+        merged.sort(key=lambda n: n.score or 0, reverse=True)
+        nodes = merged[:RERANK_TOP_K * len(detected)]
+
     synthesizer = get_response_synthesizer()
     response = synthesizer.synthesize(question, nodes=nodes)
 
-    sources = []
-    for node in response.source_nodes:
-        sources.append({
+    sources = [
+        {
             "text": node.node.text,
             "card_name": node.node.metadata.get("card_name", "Unknown"),
             "source_file": node.node.metadata.get("source", ""),
             "page": node.node.metadata.get("page_label", "?"),
-            "score": round(node.score, 3) if node.score else None,
-        })
+            "score": round(node.score, 4) if node.score else None,
+        }
+        for node in response.source_nodes
+    ]
 
     return {
         "answer": str(response),
@@ -147,22 +101,27 @@ def query(question: str, query_engine=None):
     }
 
 
+# ── CLI smoke test ────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Quick CLI test
-    print("\n💳 Credit Card Benefits RAG — Phase 2 (Metadata Filtering)\n")
-    index = load_query_engine()
+    import os
+    reranker_status = "enabled" if os.getenv("COHERE_API_KEY") else "disabled (set COHERE_API_KEY to enable)"
+    print(f"\n💳 Credit Card Benefits RAG — Phase 2 (Hybrid + Reranker {reranker_status})\n")
+
+    engine = load_query_engine()
 
     test_questions = [
         "What is the auto rental coverage on the United Explorer Card?",
         "Does the Amex Gold card include airport lounge access?",
         "How does the Trip Delay differ between the Capital One Venture X and the United Explorer?",
+        "Which card has a higher Trip Cancellation limit, the United Explorer Card or the Bilt Palladium?",
     ]
 
     for q in test_questions:
+        result = query(q, engine)
         print(f"Q: {q}")
-        result = query(q, index)
         print(f"A: {result['answer']}")
-        print(f"   Detected cards: {result['detected_cards']}")
-        print(f"   Sources: {[s['card_name'] for s in result['sources']]}")
-        print(f"   Scores:  {[s['score'] for s in result['sources']]}")
+        print(f"   Detected: {result['detected_cards']}")
+        print(f"   Sources:  {[s['card_name'] for s in result['sources']]}")
+        print(f"   Scores:   {[s['score'] for s in result['sources']]}")
         print()

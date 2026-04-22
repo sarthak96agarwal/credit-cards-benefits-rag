@@ -43,7 +43,7 @@ def run_evaluation(phase_label: str = ""):
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}\n")
 
-    engine = load_query_engine()
+    engine = load_query_engine()  # returns (index, all_nodes)
 
     # ── Step 1: Run every test question through your RAG pipeline ─────────────
     print(f"⏳ Running {len(TEST_QUESTIONS)} questions through RAG pipeline...\n")
