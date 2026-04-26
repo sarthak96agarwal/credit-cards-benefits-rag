@@ -13,7 +13,7 @@ from llama_index.core.response_synthesizers import get_response_synthesizer
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
-from config import EMBED_MODEL, LLM_MODEL, RERANK_TOP_K, SYSTEM_PROMPT
+from config import EMBED_MODEL, LLM_MODEL, SYSTEM_PROMPT
 from card_detector import detect_cards
 from store import load_index, get_all_nodes
 from retriever import hybrid_retrieve
@@ -71,14 +71,24 @@ def query(question: str, query_engine: tuple | None = None) -> dict:
         nodes = hybrid_retrieve(index, all_nodes, question, card_name=detected[0])
 
     else:
-        # Per-card retrieval — keeps each card's chunks from being diluted
-        # by the other card's semantic similarity scores during vector search.
-        merged = []
-        for card in detected:
-            merged.extend(hybrid_retrieve(index, all_nodes, question, card_name=card))
-        # Re-sort by reranker score; keep top N per card
-        merged.sort(key=lambda n: n.score or 0, reverse=True)
-        nodes = merged[:RERANK_TOP_K * len(detected)]
+        # Per-card retrieval + per-card reranking.
+        # Each card's chunks are ranked independently by the reranker, so the
+        # top-N from each card are already the most relevant for that card.
+        #
+        # We interleave rather than sort-and-merge: sorting all chunks jointly
+        # by reranker score lets one card dominate the top positions (since
+        # scores aren't comparable across cards). Interleaving guarantees both
+        # cards appear at high positions, which matters for RAGAS's
+        # position-weighted context precision and for the LLM having balanced context.
+        per_card_nodes = [
+            hybrid_retrieve(index, all_nodes, question, card_name=card)
+            for card in detected
+        ]
+        nodes = [
+            node
+            for rank_position in zip(*per_card_nodes)  # (A_rank1, B_rank1), (A_rank2, B_rank2)...
+            for node in rank_position
+        ]
 
     synthesizer = get_response_synthesizer()
     response = synthesizer.synthesize(question, nodes=nodes)

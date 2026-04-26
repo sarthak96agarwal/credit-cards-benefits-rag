@@ -16,7 +16,7 @@ from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, FilterOperator
 from llama_index.retrievers.bm25 import BM25Retriever
 
-from config import TOP_K, RERANK_TOP_K, RRF_K, RERANK_MODEL
+from config import TOP_K, RERANK_TOP_K, RERANK_MIN_K, SCORE_GAP_THRESHOLD, RRF_K, RERANK_MODEL
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -107,12 +107,22 @@ def rerank(
     top_k: int = RERANK_TOP_K,
 ) -> list[NodeWithScore]:
     """
-    Re-score nodes using Cohere's cross-encoder reranker.
+    Re-score nodes using Cohere's cross-encoder reranker, then apply an
+    adaptive score gap cutoff.
 
     The reranker evaluates each (question, chunk) pair jointly — unlike
     embeddings which encode query and chunk independently. This catches
     cases where a chunk is superficially similar to the query (high cosine
     similarity) but doesn't actually answer it, and vice versa.
+
+    After reranking, the score gap cutoff trims trailing chunks:
+    - Always keeps at least RERANK_MIN_K chunks (recall floor)
+    - Scans scores from rank 1 downward; stops at the first consecutive
+      gap >= SCORE_GAP_THRESHOLD (a "cliff" in relevance)
+    - Never exceeds top_k
+
+    This improves context precision without a hard score threshold: it only
+    cuts when the signal is unambiguous (a sudden score cliff).
 
     Falls back to the top_k RRF results if COHERE_API_KEY is not set.
     Enforces a minimum interval between calls for trial key rate limits.
@@ -130,9 +140,18 @@ def rerank(
 
     from llama_index.postprocessor.cohere_rerank import CohereRerank
     reranker = CohereRerank(api_key=api_key, model=RERANK_MODEL, top_n=top_k)
-    result = reranker.postprocess_nodes(nodes, query_str=question)
+    reranked = reranker.postprocess_nodes(nodes, query_str=question)
     _last_rerank_time = time.time()
-    return result
+
+    # Adaptive score gap cutoff
+    cutoff = len(reranked)  # default: keep all top_k
+    for i in range(RERANK_MIN_K, len(reranked) - 1):
+        gap = reranked[i].score - reranked[i + 1].score
+        if gap >= SCORE_GAP_THRESHOLD:
+            cutoff = i + 1  # keep chunks 0..i (inclusive)
+            break
+
+    return reranked[:cutoff]
 
 
 # ── Combined pipeline ─────────────────────────────────────────────────────────

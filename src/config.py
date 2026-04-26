@@ -19,7 +19,9 @@ RERANK_MODEL = "rerank-v3.5"  # Cohere
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 
 TOP_K = 8          # candidates fetched per card from each retriever (vector + BM25)
-RERANK_TOP_K = 5   # chunks kept after reranking
+RERANK_TOP_K = 5   # max chunks kept after reranking
+RERANK_MIN_K = 2   # min chunks always kept (floor to protect recall)
+SCORE_GAP_THRESHOLD = 0.35  # drop remaining chunks when consecutive score gap exceeds this
 RRF_K = 60         # reciprocal rank fusion constant (higher = smoother rank blending)
 
 # ── Cards ─────────────────────────────────────────────────────────────────────
