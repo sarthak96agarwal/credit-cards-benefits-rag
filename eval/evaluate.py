@@ -1,14 +1,18 @@
 # eval/evaluate.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Runs RAGAS evaluation against your test dataset and saves results to CSV.
+# Runs RAGAS evaluation against your test dataset and saves results to CSV
+# and Weights & Biases.
 #
 # Usage:
 #   python eval/evaluate.py
-#   python eval/evaluate.py --phase "Phase 1 - Naive"   # label your run
+#   python eval/evaluate.py --phase "Phase 3 - Score Gap 0.35"
+#   python eval/evaluate.py --compare   # print comparison of all past runs
+#   python eval/evaluate.py --upload-history  # upload all past CSVs to W&B
 # ─────────────────────────────────────────────────────────────────────────────
 
 import sys
 import argparse
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -27,6 +31,7 @@ from ragas.metrics import (
 )
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings as LCOpenAIEmbeddings
 from dotenv import load_dotenv
+import wandb
 
 from query import load_query_engine, query as rag_query
 from eval.test_dataset import TEST_QUESTIONS
@@ -36,6 +41,49 @@ load_dotenv()
 RESULTS_DIR = Path("eval/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+WANDB_PROJECT = os.getenv("WANDB_PROJECT", "cc-benefits-rag")
+WANDB_ENTITY  = os.getenv("WANDB_ENTITY", None)
+
+METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
+
+
+# ── W&B logging ───────────────────────────────────────────────────────────────
+
+def log_to_wandb(df: pd.DataFrame, phase_label: str, means: dict):
+    """Log a completed eval run to Weights & Biases."""
+    run = wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        name=phase_label or "unlabeled",
+        config={"phase": phase_label},
+        reinit=True,
+    )
+
+    # Overall summary metrics
+    wandb.log({f"overall/{m}": means[m] for m in METRIC_NAMES if m in means})
+
+    # Per-category metrics
+    df_cat = df.groupby("category")[METRIC_NAMES].mean()
+    for category, row in df_cat.iterrows():
+        for m in METRIC_NAMES:
+            wandb.log({f"{category}/{m}": row[m]})
+
+    # Per-question detail table (includes retrieved chunks for debugging)
+    cols = ["user_input", "response", "reference", "card", "category",
+            "retrieved_chunks", "retrieved_scores"] + METRIC_NAMES
+    cols = [c for c in cols if c in df.columns]
+    table = wandb.Table(dataframe=df[cols].reset_index(drop=True))
+    wandb.log({"eval_results": table})
+
+    # Per-category bar chart summary
+    cat_table = wandb.Table(dataframe=df_cat.round(3).reset_index())
+    wandb.log({"category_breakdown": cat_table})
+
+    run.finish()
+    print(f"   W&B run: {run.url}\n")
+
+
+# ── Main evaluation ───────────────────────────────────────────────────────────
 
 def run_evaluation(phase_label: str = ""):
     print(f"\n{'='*60}")
@@ -49,7 +97,7 @@ def run_evaluation(phase_label: str = ""):
     print(f"⏳ Running {len(TEST_QUESTIONS)} questions through RAG pipeline...\n")
 
     samples = []
-    cards, categories = [], []
+    cards, categories, retrieved_chunks, retrieved_scores = [], [], [], []
 
     for i, item in enumerate(TEST_QUESTIONS):
         q = item["question"]
@@ -65,6 +113,14 @@ def run_evaluation(phase_label: str = ""):
         ))
         cards.append(item["card"])
         categories.append(item["category"])
+
+        # Store chunks as "chunk1_text | chunk2_text | ..." for the W&B table
+        chunks_str = "\n---\n".join(
+            f"[{src['card_name']} | p{src['page']} | score={src['score']}]\n{src['text']}"
+            for src in result["sources"]
+        )
+        retrieved_chunks.append(chunks_str)
+        retrieved_scores.append(str([src["score"] for src in result["sources"]]))
 
         print(f"           → {result['answer'][:80]}...")
         print(f"           → {len(result['sources'])} chunks retrieved\n")
@@ -90,8 +146,7 @@ def run_evaluation(phase_label: str = ""):
 
     # ── Step 4: Print summary ─────────────────────────────────────────────────
     df = results.to_pandas()
-    metric_names = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
-    means = {m: df[m].mean() for m in metric_names if m in df.columns}
+    means = {m: df[m].mean() for m in METRIC_NAMES if m in df.columns}
 
     print(f"\n{'='*60}")
     print(f"  Results — {phase_label}")
@@ -105,6 +160,8 @@ def run_evaluation(phase_label: str = ""):
     # ── Step 5: Save detailed results to CSV ──────────────────────────────────
     df["card"] = cards
     df["category"] = categories
+    df["retrieved_chunks"] = retrieved_chunks
+    df["retrieved_scores"] = retrieved_scores
     df["phase"] = phase_label
     df["timestamp"] = datetime.now().isoformat()
 
@@ -118,12 +175,18 @@ def run_evaluation(phase_label: str = ""):
 
     # ── Step 6: Per-category breakdown ────────────────────────────────────────
     print("Per-category breakdown:")
-    df_cat = df.groupby("category")[["faithfulness", "answer_relevancy", "context_recall", "context_precision"]].mean()
+    df_cat = df.groupby("category")[METRIC_NAMES].mean()
     print(df_cat.round(3).to_string())
     print()
 
+    # ── Step 7: Log to W&B ────────────────────────────────────────────────────
+    print("⏳ Logging to Weights & Biases...")
+    log_to_wandb(df, phase_label, means)
+
     return results, df
 
+
+# ── Compare past runs ─────────────────────────────────────────────────────────
 
 def compare_runs():
     """Print a comparison table of all saved eval runs."""
@@ -150,13 +213,37 @@ def compare_runs():
     print()
 
 
+# ── Upload historical CSVs to W&B ────────────────────────────────────────────
+
+def upload_history():
+    """Upload all existing eval CSVs to W&B as separate runs."""
+    csvs = sorted(RESULTS_DIR.glob("*.csv"))
+    if not csvs:
+        print("No eval CSVs found.")
+        return
+
+    print(f"Uploading {len(csvs)} runs to W&B...\n")
+    for csv in csvs:
+        df = pd.read_csv(csv)
+        raw = df["phase"].iloc[0] if "phase" in df.columns else None
+        phase_label = str(raw) if raw and str(raw) != "nan" else csv.stem
+        means = {m: df[m].mean() for m in METRIC_NAMES if m in df.columns}
+        print(f"  {phase_label}")
+        log_to_wandb(df, phase_label, means)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", default="", help="Label for this run e.g. 'Phase 1 - Naive'")
+    parser.add_argument("--phase", default="", help="Label for this run e.g. 'Phase 3 - Score Gap 0.35'")
     parser.add_argument("--compare", action="store_true", help="Print comparison of all past runs")
+    parser.add_argument("--upload-history", action="store_true", help="Upload all past CSVs to W&B")
     args = parser.parse_args()
 
     if args.compare:
         compare_runs()
+    elif args.upload_history:
+        upload_history()
     else:
         run_evaluation(phase_label=args.phase)

@@ -16,6 +16,7 @@ from llama_index.llms.openai import OpenAI
 from config import EMBED_MODEL, LLM_MODEL, SYSTEM_PROMPT
 from card_detector import detect_cards
 from store import load_index, get_all_nodes
+
 from retriever import hybrid_retrieve
 
 load_dotenv()
@@ -28,13 +29,13 @@ Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL)
 
 def load_query_engine() -> tuple:
     """
-    Load the index and prepare all nodes for BM25.
+    Load the Pinecone index and BM25 corpus.
 
     Returns:
         (index, all_nodes) — pass this to query() to avoid reloading on each call.
     """
-    index, collection = load_index()
-    all_nodes = get_all_nodes(collection)
+    index = load_index()
+    all_nodes = get_all_nodes()
     return index, all_nodes
 
 

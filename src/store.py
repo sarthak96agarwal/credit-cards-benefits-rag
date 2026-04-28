@@ -1,52 +1,60 @@
 """
-ChromaDB store access.
+Pinecone store access.
 Responsible for loading the vector index and fetching raw nodes for BM25.
+
+Vector search  → Pinecone (managed hosted vector DB)
+BM25 corpus    → data/bm25_corpus.json (serialized at index time, loaded into memory)
 """
 
-import chromadb
+import json
+import os
+
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.schema import TextNode
-from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.vector_stores.pinecone import PineconeVectorStore
+from pinecone import Pinecone
 
-from config import CHROMA_DIR, COLLECTION_NAME
+from config import PINECONE_INDEX_NAME, BM25_CORPUS_PATH
 
 
-def load_index() -> tuple[VectorStoreIndex, chromadb.Collection]:
+def load_index() -> VectorStoreIndex:
     """
-    Load the persisted ChromaDB index.
-
-    Returns:
-        (index, collection) — index for vector search, collection for BM25 node fetch.
+    Connect to the Pinecone index and return a VectorStoreIndex for similarity search.
 
     Raises:
-        FileNotFoundError if the index hasn't been built yet.
+        ValueError if PINECONE_API_KEY is not set.
     """
-    if not CHROMA_DIR.exists():
-        raise FileNotFoundError(
-            f"No index found at {CHROMA_DIR}. Run `python src/index.py` first."
-        )
+    api_key = os.getenv("PINECONE_API_KEY")
+    if not api_key:
+        raise ValueError("PINECONE_API_KEY is not set.")
 
-    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
-    vector_store = ChromaVectorStore(chroma_collection=collection)
+    pc = Pinecone(api_key=api_key)
+    pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+    vector_store = PineconeVectorStore(pinecone_index=pinecone_index)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
-
-    return index, collection
+    return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
 
-def get_all_nodes(collection: chromadb.Collection) -> list[TextNode]:
+def get_all_nodes() -> list[TextNode]:
     """
-    Fetch every document node from ChromaDB as TextNode objects.
+    Load all document nodes from the BM25 corpus JSON file.
 
-    Used to build the BM25 corpus. When the index is loaded via
-    VectorStoreIndex.from_vector_store(), the in-memory docstore is empty —
-    nodes live in ChromaDB — so we fetch them directly.
+    The corpus is serialized during indexing (src/index.py) and committed to
+    the repo. Pinecone is not designed for full-corpus scans, so BM25 keyword
+    search uses this lightweight local file instead.
+
+    Raises:
+        FileNotFoundError if the corpus hasn't been built yet (run src/index.py).
     """
-    result = collection.get(include=["documents", "metadatas"])
-    return [
-        TextNode(id_=doc_id, text=text, metadata=metadata or {})
-        for doc_id, text, metadata in zip(
-            result["ids"], result["documents"], result["metadatas"]
+    if not BM25_CORPUS_PATH.exists():
+        raise FileNotFoundError(
+            f"BM25 corpus not found at {BM25_CORPUS_PATH}. Run `python src/index.py` first."
         )
+
+    with open(BM25_CORPUS_PATH) as f:
+        data = json.load(f)
+
+    return [
+        TextNode(id_=n["id"], text=n["text"], metadata=n["metadata"])
+        for n in data
     ]

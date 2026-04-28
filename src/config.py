@@ -3,12 +3,13 @@ Central configuration for the CC Benefits RAG pipeline.
 All tunable constants live here — don't scatter magic values across modules.
 """
 
+import os
 from pathlib import Path
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 
-CHROMA_DIR = Path("data/chroma_db")
-COLLECTION_NAME = "cc_benefits"
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "cc-benefits")
+BM25_CORPUS_PATH = Path("data/bm25_corpus.json")  # raw nodes for BM25 keyword search
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
