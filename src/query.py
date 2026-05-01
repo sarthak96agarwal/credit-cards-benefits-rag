@@ -21,6 +21,16 @@ from retriever import hybrid_retrieve
 
 load_dotenv()
 
+# ── Langfuse — instrument all LlamaIndex ops (LLM calls, embeddings, retrievers)
+# Reads LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST from env.
+# No-ops gracefully if keys are absent (local runs without tracing).
+try:
+    from langfuse.llama_index import LlamaIndexInstrumentor
+    _instrumentor = LlamaIndexInstrumentor()
+    _instrumentor.start()
+except Exception:
+    pass
+
 Settings.llm = OpenAI(model=LLM_MODEL, temperature=0, system_prompt=SYSTEM_PROMPT)
 Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL)
 

@@ -27,6 +27,9 @@ streamlit==1.56.0
 fastapi==0.115.12
 uvicorn==0.34.2
 
+# Observability
+langfuse
+
 # Utilities
 python-dotenv==1.2.2
 pandas==2.2.3
