@@ -29,6 +29,7 @@ uvicorn==0.34.2
 
 # Observability
 langfuse
+structlog
 
 # Utilities
 python-dotenv==1.2.2

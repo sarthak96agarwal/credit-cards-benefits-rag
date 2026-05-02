@@ -6,3 +6,6 @@ data/chroma_db/
 data/pdfs/
 .DS_Store
 wandb/
+.agents/
+.claude/
+skills-lock.json
